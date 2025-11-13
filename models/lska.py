@@ -1,29 +1,15 @@
 """
-lska.py
+lska.py (updated)
 
-Large Separable Kernel Attention (LSKA)
+Large Separable Kernel Attention (LSKA) - tolerant split sizes
 
-LSKA provides large spatial receptive field attention at relatively low cost by:
-- Splitting channels into groups (num_splits).
-- Applying different large-kernel depthwise operations per split (e.g., 1xK, Kx1 decompositions).
-- Concatenating outputs, fusing, and computing spatial attention using pooled descriptors (avg+max).
-- Reweighting original input features by the generated spatial attention map.
-
-Design goals:
-- Capture long, thin structures (cracks) and extended context.
-- Keep FLOPs manageable by using depthwise separable / decomposed large kernels.
-- Be plug-and-play at backbone tail and neck fusion points.
-
-Usage:
-    from models.lska import LSKA
-    m = LSKA(channels=512, num_splits=3, large_kernel=21)
-    out = m(x)  # x: (B, 512, H, W)
-
-Tweakable parameters:
-- num_splits: number of channel sub-groups to apply different kernel sizes to.
-- large_kernel: main large kernel size used for two decomposed convs (k x 1 and 1 x k).
-- mid_kernel: smaller kernel used for an additional branch (defaults to 7).
-- reduction: final channel reduction factor for the attention conv.
+Changes vs previous:
+- If `num_splits` does not evenly divide `channels`, we now either:
+  1) automatically choose a sensible divisor from a preferred set [4,3,2,1] if user passed None,
+  OR
+  2) if user provided num_splits that doesn't divide channels, distribute the remainder
+     so that splits sizes are either `base` or `base+1` (first `remainder` splits get +1).
+- This prevents AssertionError for common channel sizes (e.g., 256, 512, 768, 1024).
 """
 
 from typing import List, Optional
@@ -33,7 +19,9 @@ import torch.nn.functional as F
 
 
 class SplitDWConv(nn.Module):
-    """Helper block: depthwise conv with optional 1xK/Kx1 decomposition to save cost."""
+    """Helper block: depthwise conv with optional 1xK/Kx1 decomposition to save cost.
+       Works on a specific channel group (group channels).
+    """
     def __init__(self, channels: int, kernel: int, decomposed: bool = True):
         super().__init__()
         pad = kernel // 2
@@ -63,45 +51,63 @@ class SplitDWConv(nn.Module):
 
 class LSKA(nn.Module):
     """
-    Large Separable Kernel Attention (LSKA)
+    Large Separable Kernel Attention (LSKA) - robust split sizes.
 
     Args:
         channels: input channels
-        num_splits: number of channel splits/branches (default 3)
-        large_kernel: the large kernel to use for splits (default 21)
+        num_splits: desired number of channel splits/branches (optional). If None,
+                    a sensible divisor will be chosen automatically (4, 3, 2, or 1).
+                    If provided and does not divide channels evenly, channels will
+                    be distributed across splits so each split has either base or base+1 channels.
+        large_kernel: the large kernel to use for two decomposed convs (default 21)
         mid_kernel: medium kernel for the third branch (default 7)
-        reduction: intermediate channels reduction for attention conv (default 16)
+        reduction: unused here but kept for API compatibility
     """
     def __init__(self,
                  channels: int,
-                 num_splits: int = 3,
+                 num_splits: Optional[int] = None,
                  large_kernel: int = 21,
                  mid_kernel: int = 7,
                  reduction: int = 16):
         super().__init__()
-        assert channels % num_splits == 0, "channels must be divisible by num_splits"
+
+        # If user didn't specify splits, pick a sensible divisor (prefer 4, then 3, then 2)
+        if num_splits is None:
+            for d in (4, 3, 2, 1):
+                if channels % d == 0:
+                    chosen_splits = d
+                    break
+            else:
+                chosen_splits = 1
+            num_splits = chosen_splits
+
+        # Compute split sizes that sum to channels.
+        # If channels % num_splits != 0, distribute remainder across the first `r` groups.
+        base = channels // num_splits
+        rem = channels % num_splits
+        split_sizes = [base + (1 if i < rem else 0) for i in range(num_splits)]
+        assert sum(split_sizes) == channels
+
         self.channels = channels
         self.num_splits = num_splits
-        self.split_c = channels // num_splits
+        self.split_sizes = split_sizes
 
-        # Choose kernels for splits
+        # Choose kernels for splits. Use large_kernel for first two splits (if exist), mid_kernel for third.
         kernels = []
-        if num_splits >= 1:
-            kernels.append(large_kernel)
-        if num_splits >= 2:
-            kernels.append(large_kernel)
-        if num_splits >= 3:
-            kernels.append(mid_kernel)
-        # If more splits requested, reuse mid_kernel for extras
-        while len(kernels) < num_splits:
-            kernels.append(mid_kernel)
+        for i in range(num_splits):
+            if i < 2:
+                kernels.append(large_kernel)
+            else:
+                kernels.append(mid_kernel)
 
         # Per-split depthwise decomposed convs
-        self.split_convs = nn.ModuleList([SplitDWConv(self.split_c, k, decomposed=True) for k in kernels])
+        self.split_convs = nn.ModuleList([
+            SplitDWConv(ch_size, k, decomposed=True) for ch_size, k in zip(self.split_sizes, kernels)
+        ])
 
         # Fuse conv after concatenation
         self.fuse = nn.Sequential(
-            nn.Conv2d(self.split_c * num_splits, channels, kernel_size=1, bias=False),
+            nn.Conv2d(sum(self.split_sizes), channels, kernel_size=1, bias=False),
             nn.BatchNorm2d(channels),
             nn.SiLU(inplace=True)
         )
@@ -112,7 +118,6 @@ class LSKA(nn.Module):
             nn.Sigmoid()
         )
 
-        # optional channel reduction for computational control (not used to alter shape)
         self.reduction = reduction
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -120,7 +125,8 @@ class LSKA(nn.Module):
         x: [B, C, H, W]
         returns: [B, C, H, W] reweighted
         """
-        parts = torch.split(x, self.split_c, dim=1)
+        # split according to computed split sizes
+        parts = torch.split(x, self.split_sizes, dim=1)
         outs: List[torch.Tensor] = []
         # apply per-split large depthwise convs
         for p, conv in zip(parts, self.split_convs):
@@ -137,14 +143,3 @@ class LSKA(nn.Module):
         w = self.att_conv(sa)                         # [B,1,H,W] in (0,1)
         out = x * w                                   # reweight original features
         return out
-
-
-# quick smoke test if run as script
-if __name__ == "__main__":
-    import torch
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print("Device:", device)
-    m = LSKA(channels=256, num_splits=3, large_kernel=21, mid_kernel=7).to(device)
-    x = torch.randn(2, 256, 80, 80).to(device)
-    y = m(x)
-    print("LSKA out:", y.shape)  # expect [2,256,80,80]
