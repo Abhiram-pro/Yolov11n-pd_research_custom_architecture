@@ -1,0 +1,40 @@
+# training/train.yaml
+# Hyperparameters & training options (paper-matching)
+# Use this as canonical training config for YOLO11n-PD experiments.
+
+# dataset & model pointers (strings are overridable via CLI/wrapper)
+model: ../models/yolo11n_pd.yaml   # path from training/ to models/
+data: ../data/rdd2022.yaml         # dataset config file (train/val paths), must exist
+
+# training schedule
+epochs: 300
+batch: 16
+imgsz: 640
+
+# optimizer
+optimizer: SGD
+lr0: 0.01          # initial learning rate
+momentum: 0.937
+weight_decay: 0.0005
+
+# scheduler
+scheduler: cosine   # cosine annealing (common for YOLO training)
+warmup_epochs: 3
+
+# augmentation control
+mosaic: false       # start with mosaic disabled; wrapper will enable it in final 10 epochs
+mosaic_last_epochs: 10
+
+# losses / detection options (use YOLO defaults: Varifocal, DFL, CIoU etc.)
+# these fields are informational and left for training backend to use
+use_vfl: true
+use_dfl: true
+use_ciou: true
+
+# reproducibility
+seed: 42
+
+# logging & checkpoints
+project: runs
+name_prefix: yolov11n_pd_expt   # run name will be {name_prefix}_{timestamp}
+save_period: 10   # save intermediate checkpoints every N epochs (optional)
