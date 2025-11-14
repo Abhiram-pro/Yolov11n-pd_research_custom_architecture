@@ -96,10 +96,8 @@ class YOLO11nPD(nn.Module):
         self.p3_fuse = C3k2Ghost(768, 256, n=1)   # after concat p4_up + p3 -> reduce to 256
 
         # LSKA on fused maps
-        # quick fix — use the actual fused channel widths
-        self.lska_mid = LSKA(1024, num_splits=3, large_kernel=21)  # because f4 = p5_up(512) + p4(512) -> 1024
-        self.lska_shallow = LSKA(768, num_splits=3, large_kernel=21)  # because f3 = p4_up(512) + p3(256) -> 768
-        self.lska_deep = LSKA(512, num_splits=3, large_kernel=21)  # deep-level single map stays 512
+        self.lska_mid = LSKA(1024, num_splits=3, large_kernel=21)
+        self.lska_shallow = LSKA(256, num_splits=3, large_kernel=21)
 
         # expand p5 channels to 1024 for head (mimic concatenation growth)
         self.expand_p5 = ConvBNAct(512, 1024, k=1)
