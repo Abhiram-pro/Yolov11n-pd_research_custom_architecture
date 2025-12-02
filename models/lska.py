@@ -136,7 +136,11 @@ class LSKA(nn.Module):
     # -----------------------------------------------------
     def _rebuild_for_channels(self, new_C: int):
         """Rebuilds split sizes and conv layers dynamically to match new channel count."""
+        # Get the device of the current module
+        device = next(self.parameters()).device
         self._build_splits_and_layers(new_C)
+        # Move newly created layers to the same device
+        self.to(device)
 
     # -----------------------------------------------------
     # Forward pass
